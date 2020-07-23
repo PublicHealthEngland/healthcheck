@@ -1,0 +1,1269 @@
+--------------------------------------------
+--------------------------------------------
+
+/* SCRIPT 3 - RISK FACTOR RECORDING FOR NHSHC ATTENDEES AND NON-ATTENDEES 
+BY FINANCIAL YEAR 
+This script appends risk factor metrics to the table of NHSHC attendees
+and non-attendees by financial year, choosing the best available 
+metric for each risk factor in a window around the patient's NHSHC event.
+
+Non-attendees: Whole extract considered
+Attendees: Restricted time window:
+
+1) ON DAY - on the day of the NHSHC contact
+2) BEFORE - up to 365 before
+3) AFTER - up to 90 days after 
+
+Risk factors:
+- BMI/HEIGHT/WEIGHT/WAIST CIRCUMFERENCE
+- BLOOD PRESSURE (O/E systolic and diastolic reading)
+- CHOLESTEROL (total and valid ratio) 
+- SMOKING STATUS
+- PHYSICAL ACTIVITY STATUS
+- ALCOHOL STATUS
+- CVD RISK SCORE
+- GLUCOSE 
+- Rheumatoid arthritis
+- CVD FAMILY HISTORY
+
+*/
+
+--Emma Clegg
+--Last updated:
+--20/5/19
+
+--contains:
+
+	-- STEP 1 - Extract and group relevant risk factor read codes
+	-- STEP 2 - Extract risk factor records for the NHSHC attendees & non-attendees 
+	     -- a. Extract journals records 
+		 -- b. Group records by patient, financial year, cluster type and day - take 
+		       -- one plausible measure per patient per day (i.e. take lowest systolic BP)
+	-- STEP 3 - Assign one risk factor record per patient per financial year 
+	          -- before/on day/after NHSHC contact
+	     -- a. Identify risk factor record closest to NHSHC contact in each time period
+		 -- b. Separate systolic and diastolic records into separate fields
+	-- STEP 4 - Assign final risk factor metrics to patients
+	-- STEP 5 - Save to permanent table
+	-- STEP 6 - Calculate proportion of patients with complete NHSHC information
+	-- STEP 7 - Checks
+
+--------------------------------------------------------------------------------
+-- Script uses:
+-- 1) Table of attendees/non-attendees with patient characteristics joined on
+-- SELECT TOP 10 * FROM [NHS_Health_Checks].[dbo].[EC_2_COHORT_CHARS]
+
+-- 2) Read code lookup table
+-- SELECT * FROM [NHS_Health_Checks].[dbo].[EXPANDED_CLUSTERS_REF]
+
+-- 3) TE created lookup table for smoking status 
+-- SELECT * FROM [NHS_Health_Checks].[dbo].[TE_SMOKE_GENERIC_CODES]
+
+-- 4) TE created lookup table for alcohol status 
+-- SELECT * FROM [NHS_Health_Checks].[dbo].[TE_ALCOHOL_LOOKUP]
+
+
+-- Script produces:
+-- 1) Table of attendees/non-attendees with risk factor metrics at time of 
+--    NHSHC contact
+-- SELECT TOP 100 * FROM [NHS_Health_Checks].[dbo].[EC_3_COHORT_RISK_FACTORS]
+
+-- 2) Proportion of patients with complete NHSHC information
+-- SELECT * FROM [NHS_Health_Checks].[dbo].[EC_FULL_NHSHC]
+			
+
+/*****************************************************************************/
+    --------------------------------------------------------------
+	-- STEP 1 - Extract and group risk factor read codes
+    --------------------------------------------------------------
+
+/* Extract risk factor records using their cluster join key,
+and allocate to a cluster type.
+
+Create a field "status" to store additional information/categorisation on 
+descriptive risk factors (this will be null for risk factors with a numerical
+measurement */
+
+DROP TABLE IF EXISTS #COMB_CODES;
+
+SELECT A.CLUSTER_JOIN_KEY 
+    ,A.CLUSTER_DESCRIPTION
+	,A.CODE_DESCRIPTION
+	,ROW_NUMBER() OVER(PARTITION BY A.CLUSTER_JOIN_KEY ORDER BY A.CODE_DESCRIPTION) as 'NO_LABELS'
+	-- Define cluster type (one for each risk factor)
+	,CASE WHEN A.CLUSTER_DESCRIPTION = 'weight measured or declined' THEN 'WEIGHT'
+	      WHEN A.CLUSTER_DESCRIPTION = 'height measured or declined' THEN 'HEIGHT'
+		  WHEN A.CLUSTER_DESCRIPTION = 'BMI codes'  THEN 'BMI'
+		  WHEN A.CLUSTER_DESCRIPTION = 'waist circumference measured or declined' THEN 'WAIST'
+	      WHEN A.CLUSTER_JOIN_KEY IN (558, 805) THEN 'FULL BP' -- best-populated O/E reading only; include refused test (805) here
+          WHEN A.CLUSTER_JOIN_KEY IN (575)  THEN 'DIASTOLIC'   -- best-populated O/E reading only
+          WHEN A.CLUSTER_JOIN_KEY IN (574) THEN 'SYSTOLIC'     -- best-populated O/E reading only
+		  WHEN (A.CODE_DESCRIPTION LIKE '%ratio%'
+		          AND A.CLUSTER_DESCRIPTION LIKE '%cholesterol%')
+				OR A.CLUSTER_DESCRIPTION = 'Codes for cholesterol test declined' THEN 'CHOL RATIO'   -- Include declined tests (807, 3141) here
+		  WHEN (A.CLUSTER_DESCRIPTION = 'Cholesterol recorded'
+				AND A.CODE_DESCRIPTION NOT LIKE '%ratio%'
+				AND A.CODE_DESCRIPTION NOT LIKE '%HDL%') THEN 'TOTAL CHOL'
+          WHEN (A.CLUSTER_DESCRIPTION = 'HDL cholesterol test'
+				 OR A.CODE_DESCRIPTION LIKE '%HDL cholesterol%') THEN 'HDL CHOL'
+		  WHEN A.CLUSTER_DESCRIPTION LIKE '%smoking habit codes%' THEN 'SMOKING'
+		  WHEN A.CODE_DESCRIPTION LIKE '%QRISK%' THEN 'QRISK'
+		  WHEN A.CODE_DESCRIPTION LIKE '%Framingham%' THEN 'FRAMINGHAM'
+		  WHEN A.CLUSTER_DESCRIPTION LIKE '%GPPAQ%' THEN 'GPPAQ'
+		  WHEN A.CLUSTER_DESCRIPTION LIKE '%Pulse rhythm%' THEN 'PULSE'
+		  WHEN A.CLUSTER_JOIN_KEY IN (SELECT CLUSTER_JOIN_KEY FROM [NHS_Health_Checks].[dbo].[TE_ALCOHOL_LOOKUP]
+										WHERE CODE_DESCRIPTION NOT LIKE 'Alcohol consumption' 
+									    AND CODE_DESCRIPTION NOT LIKE 'Alcohol units per week') THEN 'ALCOHOL_STATUS'
+		  WHEN A.CLUSTER_JOIN_KEY IN (SELECT CLUSTER_JOIN_KEY FROM [NHS_Health_Checks].[dbo].[TE_ALCOHOL_LOOKUP]
+										WHERE (CODE_DESCRIPTION LIKE 'Alcohol consumption' 
+									    OR CODE_DESCRIPTION LIKE 'Alcohol units per week')) THEN 'ALCOHOL_UNITS'
+		  WHEN A.CLUSTER_DESCRIPTION LIKE '%AUDIT alcohol%' THEN 'AUDIT'
+		  WHEN A.CLUSTER_DESCRIPTION LIKE '%AUDIT-C alcohol%' THEN 'AUDITC'
+		  WHEN A.CLUSTER_DESCRIPTION LIKE '%FAST alcohol%' THEN 'FAST'
+		  WHEN A.CLUSTER_DESCRIPTION LIKE '%hba1c%' THEN 'HBA1C'
+		  WHEN A.CLUSTER_DESCRIPTION LIKE '%Fasting plasma glucose codes%' THEN 'FPG'
+		  WHEN A.CLUSTER_DESCRIPTION LIKE '%Rheumatoid arthritis codes%' THEN 'R_ARTHRITIS'
+		  WHEN A.CLUSTER_DESCRIPTION = 'Family history of CVD' THEN 'CVD FAMILY HISTORY'
+		  ELSE NULL END AS 'CLUSTER_TYPE'
+
+		 -- Define status (for descriptive risk factors)
+
+           -- label declined/unsuitable tests
+     ,CASE WHEN (A.CODE_DESCRIPTION LIKE '%declined%'
+					OR A.CODE_DESCRIPTION LIKE '%unsuitable%'
+					OR A.CODE_DESCRIPTION LIKE '%refused%') THEN 'DECLINED_UNSUITABLE'
+	       -- Smoking (use TE lookup table)
+		   WHEN A.CLUSTER_DESCRIPTION LIKE '%smoking habit codes%' THEN B.SMOKE_CAT  
+           -- Alcohol (use TE lookup table)
+		   WHEN A.CLUSTER_JOIN_KEY IN (SELECT CLUSTER_JOIN_KEY FROM [NHS_Health_Checks].[dbo].[TE_ALCOHOL_LOOKUP]
+										WHERE CODE_DESCRIPTION NOT LIKE 'Alcohol consumption' 
+									    AND CODE_DESCRIPTION NOT LIKE 'Alcohol units per week')
+		   THEN C.Short_list_description  
+	       -- Pulse
+	       WHEN (A.CLUSTER_DESCRIPTION LIKE '%Pulse rhythm%' 
+		           AND A.CODE_DESCRIPTION LIKE '%rhythm regular%' OR A.CODE_DESCRIPTION LIKE '%pulse regular%') THEN 'REGULAR'                           
+	       WHEN (A.CLUSTER_DESCRIPTION LIKE '%Pulse rhythm%' 
+		           AND A.CODE_DESCRIPTION LIKE '%irregular%') THEN 'IRREGULAR' 
+		   -- Physical activity (GPPAQ)
+		   WHEN A.CODE_DESCRIPTION = 'General practice physical activity questionnaire physical activity index: active' THEN 'ACTIVE'
+		   WHEN A.CODE_DESCRIPTION = 'General practice physical activity questionnaire physical activity index: moderately active' THEN 'MODERATELY ACTIVE'
+		   WHEN A.CODE_DESCRIPTION = 'General practice physical activity questionnaire physical activity index: moderately inactive' THEN 'MODERATELY INACTIVE'
+		   WHEN A.CODE_DESCRIPTION = 'General practice physical activity questionnaire physical activity index: inactive' THEN 'INACTIVE'
+		   WHEN A.CODE_DESCRIPTION = 'General practice physical activity questionnaire' THEN 'GPPAQ - NO SCORE'
+
+		   -- Family history of CVD
+		   WHEN A.CLUSTER_DESCRIPTION = 'Family history of CVD' 
+		       AND (A.CODE_DESCRIPTION LIKE '%<55%' OR A.CODE_DESCRIPTION LIKE '%<60%' 
+					OR A.CODE_DESCRIPTION LIKE '%less than 55%' OR A.CODE_DESCRIPTION LIKE '%less than 60%')
+			   AND (A.CODE_DESCRIPTION LIKE '%1st degree%' OR A.CODE_DESCRIPTION LIKE '%first degree%') THEN 'FIRST_DEGREE_U60_CVD'
+           WHEN A.CLUSTER_DESCRIPTION = 'Family history of CVD' 
+		       AND (A.CODE_DESCRIPTION LIKE '%<55%' OR A.CODE_DESCRIPTION LIKE '%<60%' 
+					OR A.CODE_DESCRIPTION LIKE '%less than 55%' OR A.CODE_DESCRIPTION LIKE '%less than 60%') THEN 'FAMILY_U60_CVD'
+           WHEN A.CLUSTER_DESCRIPTION = 'Family history of CVD' THEN 'OTHER_FAMILY_CVD'
+
+		   ELSE NULL END AS 'STATUS'
+
+INTO #COMB_CODES 
+FROM [NHS_Health_Checks].[dbo].[EXPANDED_CLUSTERS_REF] AS A
+
+LEFT JOIN [NHS_Health_Checks].[dbo].[TE_SMOKE_GENERIC_CODES] AS B           -- Join on smoking labels
+ON A.CLUSTER_JOIN_KEY = B.CLUSTER_JOIN_KEY
+
+LEFT JOIN [NHS_Health_Checks].[dbo].[TE_ALCOHOL_LOOKUP] AS C                -- Join on alcohol labels
+ON A.CLUSTER_JOIN_KEY = C.CLUSTER_JOIN_KEY
+
+;
+
+
+/* Restrict to relevant cluster keys and de-duplicate rows.
+Assign the cluster type as "status" if risk factor has no sub-categories */
+DROP TABLE IF EXISTS #COMB_CODES_2;
+
+SELECT A.CLUSTER_JOIN_KEY 
+    ,A.CLUSTER_DESCRIPTION
+	,A.CODE_DESCRIPTION
+	,A.[CLUSTER_TYPE]
+	,COALESCE(A.[STATUS], A.[CLUSTER_TYPE]) AS [STATUS]
+INTO #COMB_CODES_2
+FROM #COMB_CODES AS A
+WHERE [CLUSTER_TYPE] IS NOT NULL AND NO_LABELS = 1 -- select one label per cluster join key
+GROUP BY A.CLUSTER_JOIN_KEY 
+    ,A.CLUSTER_DESCRIPTION
+	,A.CODE_DESCRIPTION
+	,A.[CLUSTER_TYPE]
+	,COALESCE(A.[STATUS], A.[CLUSTER_TYPE]);
+
+
+SELECT * FROM #COMB_CODES_2
+ORDER BY [CLUSTER_TYPE], 1;
+
+    --------------------------------------------------------------
+	-- STEP 2 - Extract risk factor records for the NHSHC attendees/non-attendees
+    --------------------------------------------------------------
+
+	     -- a. Extract journals records 
+
+/* Extract all relevant risk factor records for attendees/non-attendees 
+where date of record is not NULL. 
+
+Add a priority "valid" flag to the record, highest priority (2) being where VALUE1_CONDITION 
+is populated (i.e. non null) and within the plausible range, second priority (1) being a test 
+unsuitable/declined read code, and lowest priority (0) being a missing/implausible measurement 
+*/
+ DROP TABLE IF EXISTS #EC_TESTS_EXTRACT;    
+
+ SELECT 
+    A.PATIENT_JOIN_KEY
+	,A.[DATE]
+	,A.CLUSTER_JOIN_KEY 
+	,A.VALUE1_CONDITION
+	,A.VALUE2_CONDITION
+    ,B.[CLUSTER_TYPE]
+    ,B.[STATUS]
+
+	 -- Define validity flag (for numerical risk factors)
+	,CASE WHEN B.[STATUS] = 'DECLINED_UNSUITABLE' THEN 1 -- Label declined/unsuitable tests as '1'
+	      -- Label valid measurements as '2' (highest priority)
+		  WHEN B.[CLUSTER_TYPE] IN ('ALCOHOL_STATUS', 'SMOKING', 'PULSE', 'GPPAQ', 'CVD FAMILY HISTORY', 'R_ARTHRITIS') THEN 2 -- No numerical value expected for these risk factors
+		  WHEN (A.[CLUSTER_JOIN_KEY] = 558       -- O/E BP (expect value1_condition and value2_condition)
+	            AND A.VALUE1_CONDITION IS NOT NULL
+				AND A.VALUE2_CONDITION IS NOT NULL) THEN 2
+		  WHEN (A.[CLUSTER_JOIN_KEY] <> 558      -- Only need a non-null VALUE1 measure for remaining numerical risk factors
+	            AND A.VALUE1_CONDITION IS NOT NULL) THEN 2
+	       -- Label remaining null or invalid measurements as 0 (lowest priority) 
+		  ELSE 0 END AS 'VALID_FLAG'           
+		                               
+ INTO #EC_TESTS_EXTRACT
+ FROM  [NHS_Health_Checks].[dbo].[JOURNALS_TABLE_CLEANED]  AS A
+
+ INNER JOIN #COMB_CODES_2 AS B           -- Join on cluster key lookup
+ ON A.CLUSTER_JOIN_KEY = B.CLUSTER_JOIN_KEY
+
+ WHERE A.[PATIENT_JOIN_KEY] IN (SELECT PATIENT_JOIN_KEY                      -- Restrict to attendees/non-attendees
+                                   FROM [NHS_Health_Checks].[dbo].[EC_2_COHORT_CHARS]
+								   GROUP BY PATIENT_JOIN_KEY)
+ AND A.[DATE] IS NOT NULL ;
+ -- 377,009,650 rows
+ -- 3 mins
+
+
+ 		 -- b. Count how many patients are affected by multiple plausible 
+		 -- measurements/statuses on the same day
+
+/**** Need to suppress records where patients have conflicting statuses or
+measurement on same day
+(PULSE, CHOLESTEROL, SMOKING, ALCOHOL, PHYSICAL ACTIVITY, QRISK, FRAMINGHAM, GLUCOSE,
+BMI, HEIGHT, WEIGHT, WAIST)  *****/
+
+ -- Checks on STATUS field (for non-numeric risk factors)
+ DROP TABLE IF EXISTS #MULTIPLE_TESTS_STATUS;
+
+ SELECT A.[PATIENT_JOIN_KEY]
+  	,A.[DATE]
+	,A.[CLUSTER_TYPE]
+	,A.[STATUS]
+	,ROW_NUMBER() OVER(PARTITION BY A.[PATIENT_JOIN_KEY], A.[CLUSTER_TYPE], A.[DATE] ORDER BY A.[STATUS]) as 'NO_RECORDED_DAY'
+	,ROW_NUMBER() OVER(PARTITION BY A.[PATIENT_JOIN_KEY], A.[CLUSTER_TYPE] ORDER BY A.[DATE]) as 'NO_RECORDED_TOT'
+ INTO #MULTIPLE_TESTS_STATUS
+ FROM #EC_TESTS_EXTRACT AS A
+ WHERE A.[CLUSTER_TYPE] IN ('ALCOHOL_STATUS', 'SMOKING', 'PULSE', 'GPPAQ')
+ GROUP BY
+  A.[PATIENT_JOIN_KEY]
+  	,A.[DATE]
+	,A.[CLUSTER_TYPE]
+	,A.[STATUS];
+-- 51,122,229 rows
+
+-- Checks on VALUE1_CONDITION field (numeric risk factors)
+ DROP TABLE IF EXISTS #MULTIPLE_TESTS_VALUE;
+
+ SELECT A.[PATIENT_JOIN_KEY]
+  	,A.[DATE]
+	,A.[CLUSTER_TYPE]
+	,A.[VALUE1_CONDITION]
+	,ROW_NUMBER() OVER(PARTITION BY A.[PATIENT_JOIN_KEY], A.[CLUSTER_TYPE], A.[DATE] ORDER BY A.[VALUE1_CONDITION]) as 'NO_RECORDED_DAY'
+	,ROW_NUMBER() OVER(PARTITION BY A.[PATIENT_JOIN_KEY], A.[CLUSTER_TYPE] ORDER BY A.[DATE]) as 'NO_RECORDED_TOT'
+ INTO #MULTIPLE_TESTS_VALUE
+ FROM #EC_TESTS_EXTRACT AS A
+ WHERE A.VALID_FLAG = 2 -- exclude records with an invalid measurement
+ AND A.[CLUSTER_TYPE] NOT IN ('ALCOHOL_STATUS', 'SMOKING', 'PULSE', 'GPPAQ', 'CVD FAMILY HISTORY', 'R_ARTHRITIS')
+ GROUP BY
+  A.[PATIENT_JOIN_KEY]
+  	,A.[DATE]
+	,A.[CLUSTER_TYPE]
+	,A.[VALUE1_CONDITION];
+-- 205,165,134 rows
+
+
+/* Output proportion of patients affected by multiple plausible 
+values on the same day, for each risk factor 
+
+CVD risk score:
+Framingham, QRISK, QRISK2: 4.73%
+QRISK, QRISK2: 1.59%
+*/
+SELECT 
+[CLUSTER_TYPE]
+,COUNT(DISTINCT PATIENT_JOIN_KEY) AS NO_PATIENTS_MULT
+,(SELECT COUNT(DISTINCT PATIENT_JOIN_KEY) FROM [NHS_Health_Checks].[dbo].EC_2_COHORT_CHARS) AS NO_PATIENTS_TOT
+,COUNT(DISTINCT PATIENT_JOIN_KEY)*100.00/(SELECT COUNT(DISTINCT PATIENT_JOIN_KEY) FROM [NHS_Health_Checks].[dbo].EC_2_COHORT_CHARS) AS PC
+FROM  (SELECT PATIENT_JOIN_KEY,
+                  [CLUSTER_TYPE] 
+				  FROM #MULTIPLE_TESTS_STATUS
+				  WHERE NO_RECORDED_DAY > 1
+				  GROUP BY 
+				  PATIENT_JOIN_KEY,
+                  [CLUSTER_TYPE] 
+	  UNION
+	  SELECT PATIENT_JOIN_KEY,
+                  [CLUSTER_TYPE] 
+				  FROM #MULTIPLE_TESTS_VALUE 
+				  WHERE NO_RECORDED_DAY > 1
+				  GROUP BY 
+				  PATIENT_JOIN_KEY,
+                  [CLUSTER_TYPE])  AS A 
+GROUP BY [CLUSTER_TYPE]
+ORDER BY PC DESC;
+
+
+/* INVESTIGATE high proportion of patients with conflicting CVD risk
+scores on the same day. 
+
+Of patients with a Framingham score recorded, 69% of these are affected
+by a case of conflicting Framingham/CVD risk score on the same day 
+
+
+-- Count number of risk scores per patient per day
+-- (of those with Framingham recorded)
+DROP TABLE IF EXISTS #CVD_MULT_PATIENTS;
+
+SELECT 
+A.PATIENT_JOIN_KEY 
+,[DATE]
+,COUNT(DISTINCT CLUSTER_JOIN_KEY) AS NO_CLUSTERS 
+INTO #CVD_MULT_PATIENTS
+FROM #EC_TESTS_EXTRACT AS A
+
+-- restrict to Framingham score patients
+INNER JOIN (SELECT PATIENT_JOIN_KEY
+            FROM #EC_TESTS_EXTRACT
+			WHERE CLUSTER_JOIN_KEY IN (612, 3455)
+			GROUP BY PATIENT_JOIN_KEY) AS B
+ON A.PATIENT_JOIN_KEY = B.PATIENT_JOIN_KEY
+
+WHERE [CLUSTER_TYPE] = 'CVD RISK SCORE'
+AND [STATUS] <> 'DECLINED_UNSUITABLE'
+GROUP BY A.PATIENT_JOIN_KEY, [DATE]
+;
+
+SELECT TOP 10 * FROM #CVD_MULT_PATIENTS;
+
+
+/* Investigate patients with QRISK and Framingham scores on same day */
+
+-- One example
+SELECT *
+FROM #EC_TESTS_EXTRACT
+WHERE PATIENT_JOIN_KEY = 4141410
+AND [CLUSTER_TYPE] = 'CVD RISK SCORE'
+ORDER BY [DATE]
+
+-- How many affected by multiple scores on the same day?
+SELECT 
+COUNT(DISTINCT B.PATIENT_JOIN_KEY) AS NO_MULT_SCORES
+,COUNT(DISTINCT A.PATIENT_JOIN_KEY) AS NO_PATIENTS
+,COUNT(DISTINCT B.PATIENT_JOIN_KEY)*100.00/COUNT(DISTINCT A.PATIENT_JOIN_KEY) AS PC_AFFECTED
+
+FROM #CVD_MULT_PATIENTS AS A
+
+LEFT JOIN
+	(SELECT PATIENT_JOIN_KEY 
+	FROM #CVD_MULT_PATIENTS
+	WHERE NO_CLUSTERS > 1
+	GROUP BY PATIENT_JOIN_KEY) AS B
+ON A.PATIENT_JOIN_KEY = B.PATIENT_JOIN_KEY
+
+*/
+
+/* 
+Order patients' risk factor records on each day by VALID_FLAG (descending) and lowest
+to highest VALUE1 measurement.
+
+Take one reading per patient per day - this will prioritise a valid measurement 
+record over a test declined/unsuitable record, and a test declined/unsuitable record 
+over a null measurement record.
+
+Look at the time period between the risk factor record and the patient's
+most recent NHSHC contact in each financial year. Calculate "DATE_DIFF" to represent the 
+date of the record minus the date of the NHSHC contact.
+
+NOTE: This is intended to introduce duplicate rows as some patients have a NHSHC contact 
+in multiple financial years!
+
+*/
+DROP TABLE IF EXISTS #EC_TESTS_EXTRACT2;
+
+SELECT  A.[PATIENT_JOIN_KEY]
+  	,A.[DATE] AS 'TEST_DATE'
+	,A.[CLUSTER_TYPE]
+	,A.[VALID_FLAG]
+	,A.[VALUE1_CONDITION]
+	,A.[VALUE2_CONDITION]
+	,A.[STATUS] 
+	,B.FIN_YEAR
+	,B.INDEX_DATE
+	,DATEDIFF(day, CONVERT(VARCHAR, B.INDEX_DATE, 23), CONVERT(VARCHAR, A.[DATE], 23)) AS 'DATE_DIFF'
+INTO #EC_TESTS_EXTRACT2
+FROM [NHS_Health_Checks].[dbo].[EC_2_COHORT_CHARS] AS B
+
+LEFT JOIN (SELECT *
+		  ,ROW_NUMBER() OVER (PARTITION BY [PATIENT_JOIN_KEY], [CLUSTER_TYPE], [DATE] ORDER BY [VALID_FLAG] DESC, [VALUE1_CONDITION]) AS rn
+		  FROM  #EC_TESTS_EXTRACT) AS A
+ON A.PATIENT_JOIN_KEY = B.PATIENT_JOIN_KEY
+
+	-- Exclude descriptive statuses and numerical measurements where patient has multiple
+	-- conflicting recordings on the same day (apart from BP)
+LEFT JOIN (SELECT PATIENT_JOIN_KEY,
+                  [DATE],
+                  [CLUSTER_TYPE] 
+				  FROM #MULTIPLE_TESTS_STATUS
+				  WHERE NO_RECORDED_DAY > 1
+				  AND [CLUSTER_TYPE] IN ('ALCOHOL_STATUS', 'SMOKING', 'PULSE', 'GPPAQ')
+				  GROUP BY 
+				  PATIENT_JOIN_KEY,
+				  [DATE],
+                  [CLUSTER_TYPE] 
+		   UNION
+		   SELECT PATIENT_JOIN_KEY,
+                  [DATE],
+                  [CLUSTER_TYPE] 
+				  FROM #MULTIPLE_TESTS_VALUE 
+				  WHERE NO_RECORDED_DAY > 1
+				  AND [CLUSTER_TYPE] IN ('CHOL RATIO', 'TOTAL CHOL', 'HDL CHOL', 
+										 'BMI', 'HEIGHT', 'WEIGHT', 'WAIST',  -- added 16/9/19 to reflect Matt K advice
+				                         'HBA1C', 'FPG', 'QRISK', 'FRAMINGHAM')
+				  GROUP BY 
+				  PATIENT_JOIN_KEY,
+				  [DATE],
+                  [CLUSTER_TYPE]) AS C
+ON A.PATIENT_JOIN_KEY = C.PATIENT_JOIN_KEY
+AND A.[DATE] = C.[DATE]
+AND A.[CLUSTER_TYPE] = C.[CLUSTER_TYPE]
+
+WHERE A.rn = 1                   -- take top (lowest) measurement each day
+AND C.PATIENT_JOIN_KEY IS NULL   -- exclude multiple readings cases
+GROUP BY A.[PATIENT_JOIN_KEY]
+  	,A.[DATE] 
+	,A.[CLUSTER_TYPE]
+	,A.[VALID_FLAG]
+	,A.[VALUE1_CONDITION]
+	,A.[VALUE2_CONDITION]
+	,A.[STATUS]
+	,B.FIN_YEAR
+	,B.INDEX_DATE;
+-- 8 mins
+-- 409,060,010 rows
+
+-- Drop intermediary table
+DROP TABLE IF EXISTS #EC_TESTS_EXTRACT
+
+    --------------------------------------------------------------
+	-- STEP 3 - Assign one risk factor record per patient before/on day/after NHSHC
+    --------------------------------------------------------------
+
+	     -- a. Identify risk factor record closest to NHSHC in each time period
+
+/* Create a table of patients who had a risk factor record in the year before their NHSHC.
+Prioritise records by VALID_FLAG and keep each patient's most recent valid measurement 
+(for each risk factor) in this time (i.e. closest to the NHSHC date) */
+DROP TABLE IF EXISTS #EC_TESTS_BEFORE;
+
+SELECT A.[PATIENT_JOIN_KEY]
+,A.FIN_YEAR
+,A.INDEX_DATE
+,A.COHORT
+,[CLUSTER_TYPE]
+,[VALID_FLAG] AS 'VAL_FLAG_BEFORE'
+,[VALUE1_CONDITION] AS 'VAL1_BEFORE'
+,[VALUE2_CONDITION] AS 'VAL2_BEFORE'
+,[STATUS] AS 'STATUS_BEFORE'
+,[TEST_DATE] AS 'TEST_DATE_BEFORE'
+,[DATE_DIFF] AS 'DATE_DIFF_BEFORE' 
+INTO #EC_TESTS_BEFORE
+FROM [NHS_Health_Checks].[dbo].EC_2_COHORT_CHARS  AS A
+
+LEFT JOIN (SELECT * -- this orders first on valid flag descending then by most to least recent date
+			  ,ROW_NUMBER() OVER (PARTITION BY [PATIENT_JOIN_KEY], [FIN_YEAR], [CLUSTER_TYPE] ORDER BY [VALID_FLAG] DESC, [DATE_DIFF] DESC) AS rn
+			  FROM #EC_TESTS_EXTRACT2
+			  WHERE DATE_DIFF < 0) AS B
+ON A.PATIENT_JOIN_KEY = B.PATIENT_JOIN_KEY
+AND A.FIN_YEAR = B.FIN_YEAR
+
+WHERE rn = 1
+AND (A.COHORT = 'NON-ATTENDEE' 
+    OR B.[CLUSTER_TYPE] IN ('CVD FAMILY HISTORY', 'R_ARTHRITIS') 
+	OR (A.COHORT = 'ATTENDEE' AND DATE_DIFF >= -365))
+GROUP BY A.[PATIENT_JOIN_KEY]
+,A.FIN_YEAR
+,A.INDEX_DATE
+,A.COHORT
+,[CLUSTER_TYPE]
+,[VALID_FLAG]
+,[VALUE1_CONDITION]
+,[VALUE2_CONDITION]
+,[STATUS]
+,[TEST_DATE]
+,[DATE_DIFF];
+-- 71,414,852 rows
+
+
+/* Create a table of patients who had a risk factor record on the day of their NHSHC date.
+Prioritise records by VALID_FLAG and keep one measurement per patient for each cluster type */
+DROP TABLE IF EXISTS #EC_TESTS_ONDAY;
+
+SELECT A.[PATIENT_JOIN_KEY]
+,A.FIN_YEAR
+,A.INDEX_DATE
+,A.COHORT
+,[CLUSTER_TYPE]
+,[VALID_FLAG] AS 'VAL_FLAG_ONDAY'
+,[VALUE1_CONDITION] AS 'VAL1_ONDAY'
+,[VALUE2_CONDITION] AS 'VAL2_ONDAY'
+,[STATUS] AS 'STATUS_ONDAY'
+,[TEST_DATE] AS 'TEST_DATE_ONDAY'
+,[DATE_DIFF] AS 'DATE_DIFF_ONDAY' 
+INTO #EC_TESTS_ONDAY
+FROM [NHS_Health_Checks].[dbo].EC_2_COHORT_CHARS  AS A
+
+LEFT JOIN (SELECT * -- this orders first on valid flag descending then by most to least recent date
+			  ,ROW_NUMBER() OVER (PARTITION BY [PATIENT_JOIN_KEY], [FIN_YEAR], [CLUSTER_TYPE] ORDER BY [VALID_FLAG] DESC) AS rn
+			  FROM #EC_TESTS_EXTRACT2
+			  WHERE DATE_DIFF = 0) AS B
+ON A.PATIENT_JOIN_KEY = B.PATIENT_JOIN_KEY
+AND A.FIN_YEAR = B.FIN_YEAR
+
+WHERE rn = 1
+GROUP BY A.[PATIENT_JOIN_KEY]
+,A.FIN_YEAR
+,A.INDEX_DATE
+,A.COHORT
+,[CLUSTER_TYPE]
+,[VALID_FLAG]
+,[VALUE1_CONDITION]
+,[VALUE2_CONDITION]
+,[STATUS]
+,[TEST_DATE]
+,[DATE_DIFF];
+-- 66,268,019 rows
+
+
+/* Create a table of patients who had a risk factor record in the 3 months after their NHSHC date.
+Prioritise records by VALID_FLAG then keep each patient's measurement closest to the NHSHC date */
+DROP TABLE IF EXISTS #EC_TESTS_AFTER;
+
+SELECT A.[PATIENT_JOIN_KEY]
+,A.FIN_YEAR
+,A.INDEX_DATE
+,A.COHORT
+,[CLUSTER_TYPE]
+,[VALID_FLAG] AS 'VAL_FLAG_AFTER'
+,[VALUE1_CONDITION] AS 'VAL1_AFTER'
+,[VALUE2_CONDITION] AS 'VAL2_AFTER'
+,[STATUS] AS 'STATUS_AFTER'
+,[TEST_DATE] AS 'TEST_DATE_AFTER'
+,[DATE_DIFF] AS 'DATE_DIFF_AFTER' 
+INTO #EC_TESTS_AFTER
+FROM [NHS_Health_Checks].[dbo].EC_2_COHORT_CHARS  AS A
+
+LEFT JOIN (SELECT * -- this orders first on valid flag descending then by most to least recent date
+			  ,ROW_NUMBER() OVER (PARTITION BY [PATIENT_JOIN_KEY], [FIN_YEAR], [CLUSTER_TYPE] ORDER BY [VALID_FLAG] DESC, [DATE_DIFF]) AS rn
+			  FROM #EC_TESTS_EXTRACT2
+			  WHERE DATE_DIFF > 0) AS B   
+ON A.PATIENT_JOIN_KEY = B.PATIENT_JOIN_KEY
+AND A.FIN_YEAR = B.FIN_YEAR
+
+WHERE rn = 1
+AND (A.COHORT = 'NON-ATTENDEE' 
+    OR B.[CLUSTER_TYPE] IN ('CVD FAMILY HISTORY') 
+	OR (A.COHORT = 'ATTENDEE' AND DATE_DIFF <= 90))
+GROUP BY A.[PATIENT_JOIN_KEY]
+,A.FIN_YEAR
+,A.INDEX_DATE
+,A.COHORT
+,[CLUSTER_TYPE]
+,[VALID_FLAG]
+,[VALUE1_CONDITION]
+,[VALUE2_CONDITION] 
+,[STATUS]
+,[TEST_DATE]
+,[DATE_DIFF];
+-- 53,630,656 rows
+
+
+		 -- b. Separate risk factor records into separate fields
+
+/* Left join each of the BEFORE/ON DAY/AFTER tables to the table of patients with 
+a completed NHSHC. Risk factor fields will be populated only in cases of patients 
+having that particular risk factor recorded in the corresponding time period. 
+*/
+
+	-- Risk factors before NHSHC
+DROP TABLE IF EXISTS #EC_TESTS_BEFORE2;
+
+SELECT A.[PATIENT_JOIN_KEY]
+	,A.FIN_YEAR
+	,A.COHORT
+	,A.INDEX_DATE
+	,B1.VAL1_BEFORE AS 'WEIGHT_BEFORE'
+	,B1.DATE_DIFF_BEFORE AS 'WEIGHT_DIFF_BEFORE'
+	,B2.VAL1_BEFORE AS 'HEIGHT_BEFORE'
+	,B2.DATE_DIFF_BEFORE AS 'HEIGHT_DIFF_BEFORE'
+	,B3.VAL1_BEFORE AS 'BMI_BEFORE'
+	,B3.DATE_DIFF_BEFORE AS 'BMI_DIFF_BEFORE'
+	,B4.VAL1_BEFORE AS 'WAIST_BEFORE'
+	,B4.DATE_DIFF_BEFORE AS 'WAIST_DIFF_BEFORE'
+	,B5.VAL1_BEFORE AS 'SYS_BEFORE'
+	,B5.DATE_DIFF_BEFORE AS 'SYS_DIFF_BEFORE'
+	,B6.VAL1_BEFORE AS 'DIA_BEFORE'
+	,B6.DATE_DIFF_BEFORE AS 'DIA_DIFF_BEFORE'
+	,B7.VAL1_BEFORE AS 'FULL_SYS_BEFORE'
+	,B7.VAL2_BEFORE AS 'FULL_DIA_BEFORE'
+	,B7.DATE_DIFF_BEFORE AS 'FULL_DIFF_BEFORE'
+	,B8.VAL1_BEFORE AS 'TOTAL_BEFORE'
+	,B8.DATE_DIFF_BEFORE AS 'TOTAL_DIFF_BEFORE'
+	,B9.VAL1_BEFORE AS 'HDL_BEFORE'
+	,B9.DATE_DIFF_BEFORE AS 'HDL_DIFF_BEFORE'
+	,B10.VAL1_BEFORE AS 'RATIO_BEFORE'
+	,B10.DATE_DIFF_BEFORE AS 'RATIO_DIFF_BEFORE'
+	,B11.STATUS_BEFORE AS 'SMOKING_BEFORE'
+	,B11.DATE_DIFF_BEFORE AS 'SMOKING_DIFF_BEFORE'
+	,B12.VAL1_BEFORE AS 'QRISK_BEFORE'
+	,B12.DATE_DIFF_BEFORE AS 'QRISK_DIFF_BEFORE'
+	,B23.VAL1_BEFORE AS 'FRAMINGHAM_BEFORE'
+	,B23.DATE_DIFF_BEFORE AS 'FRAMINGHAM_DIFF_BEFORE'
+	,B13.STATUS_BEFORE AS 'PULSE_BEFORE'
+	,B13.DATE_DIFF_BEFORE AS 'PULSE_DIFF_BEFORE'
+	,B14.STATUS_BEFORE AS 'GPPAQ_BEFORE'
+	,B14.DATE_DIFF_BEFORE AS 'GPPAQ_DIFF_BEFORE'
+	,B15.VAL1_BEFORE AS 'FAST_BEFORE'
+	,B15.DATE_DIFF_BEFORE AS 'FAST_DIFF_BEFORE'
+	,B16.VAL1_BEFORE AS 'AUDIT_BEFORE'
+	,B16.DATE_DIFF_BEFORE AS 'AUDIT_DIFF_BEFORE'
+	,B17.VAL1_BEFORE AS 'AUDITC_BEFORE'
+	,B17.DATE_DIFF_BEFORE AS 'AUDITC_DIFF_BEFORE'
+	,B18.STATUS_BEFORE AS 'ALCOHOL_STATUS_BEFORE'
+	,B18.DATE_DIFF_BEFORE AS 'ALCOHOL_DIFF_BEFORE'
+	,B23.VAL1_BEFORE AS 'ALCOHOL_UNITS_BEFORE'
+	,B19.VAL1_BEFORE AS 'HBA1C_BEFORE'
+	,B19.DATE_DIFF_BEFORE AS 'HBA1C_DIFF_BEFORE'
+	,B20.VAL1_BEFORE AS 'FPG_BEFORE'
+	,B20.DATE_DIFF_BEFORE AS 'FPG_DIFF_BEFORE'
+	,B21.STATUS_BEFORE AS 'R_ARTHRITIS_BEFORE'
+	,B21.DATE_DIFF_BEFORE AS 'R_ARTHRITIS_DIFF_BEFORE'
+	,B22.STATUS_BEFORE AS 'CVD_FAMILY_BEFORE'
+	,B22.DATE_DIFF_BEFORE AS 'CVD_FAMILY_DIFF_BEFORE'
+
+	,CASE WHEN (B1.VAL_FLAG_BEFORE = 2 AND B2.VAL_FLAG_BEFORE = 2)  -- Calculate BMI from height and weight where available
+	      AND B1.VAL1_BEFORE/((B2.VAL1_BEFORE/100)*(B2.VAL1_BEFORE/100)) >= 12 
+		  AND B1.VAL1_BEFORE/((B2.VAL1_BEFORE/100)*(B2.VAL1_BEFORE/100)) <= 90
+	      THEN B1.VAL1_BEFORE/((B2.VAL1_BEFORE/100)*(B2.VAL1_BEFORE/100)) END AS BMI_BEFORE_CALC
+	,CASE WHEN (B8.VAL_FLAG_BEFORE = 2 AND B9.VAL_FLAG_BEFORE = 2)  -- Calculate CHOL from total and HDL where available
+	      THEN B8.VAL1_BEFORE/B9.VAL1_BEFORE END AS CHOL_RATIO_BEFORE_CALC
+	,CASE WHEN (B1.VAL_FLAG_BEFORE = 1 OR B2.VAL_FLAG_BEFORE = 1    -- Mark if test unsuitable/declined for
+	           OR B7.VAL_FLAG_BEFORE = 1 OR B10.VAL_FLAG_BEFORE = 1 -- height, weight, cholesterol, BP, CVD RISK SCORE or GPPAQ
+	           OR B12.VAL_FLAG_BEFORE = 1 OR B14.VAL_FLAG_BEFORE = 1)
+		  THEN 1 ELSE 0 END AS UNSUITABLE_DECLINED_BEFORE
+
+INTO #EC_TESTS_BEFORE2
+FROM [NHS_Health_Checks].[dbo].EC_2_COHORT_CHARS  AS A
+
+	-- BMI, Height, Weight, Waist measures
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'WEIGHT') AS B1
+ON A.[PATIENT_JOIN_KEY] = B1.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B1.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'HEIGHT') AS B2
+ON A.[PATIENT_JOIN_KEY] = B2.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B2.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'BMI') AS B3
+ON A.[PATIENT_JOIN_KEY] = B3.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B3.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'WAIST') AS B4
+ON A.[PATIENT_JOIN_KEY] = B4.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B4.FIN_YEAR
+
+	-- BP measures
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'SYSTOLIC') AS B5
+ON A.[PATIENT_JOIN_KEY] = B5.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B5.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'DIASTOLIC') AS B6
+ON A.[PATIENT_JOIN_KEY] = B6.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B6.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'FULL BP') AS B7
+ON A.[PATIENT_JOIN_KEY] = B7.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B7.FIN_YEAR
+
+	-- CHOL measures
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'TOTAL CHOL') AS B8
+ON A.[PATIENT_JOIN_KEY] = B8.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B8.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'HDL CHOL') AS B9
+ON A.[PATIENT_JOIN_KEY] = B9.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B9.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'CHOL RATIO') AS B10
+ON A.[PATIENT_JOIN_KEY] = B10.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B10.FIN_YEAR
+
+    -- Smoking status
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'SMOKING') AS B11
+ON A.[PATIENT_JOIN_KEY] = B11.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B11.FIN_YEAR
+
+    -- CVD risk score
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'QRISK') AS B12
+ON A.[PATIENT_JOIN_KEY] = B12.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B12.FIN_YEAR
+
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'FRAMINGHAM') AS B23
+ON A.[PATIENT_JOIN_KEY] = B23.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B23.FIN_YEAR
+
+    -- Pulse status
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'PULSE') AS B13
+ON A.[PATIENT_JOIN_KEY] = B13.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B13.FIN_YEAR
+
+    -- Physical activity status
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'GPPAQ') AS B14
+ON A.[PATIENT_JOIN_KEY] = B14.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B14.FIN_YEAR
+
+    -- Alcohol scores
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'FAST') AS B15
+ON A.[PATIENT_JOIN_KEY] = B15.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B15.FIN_YEAR
+
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'AUDIT') AS B16
+ON A.[PATIENT_JOIN_KEY] = B16.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B16.FIN_YEAR
+
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'AUDITC') AS B17
+ON A.[PATIENT_JOIN_KEY] = B17.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B17.FIN_YEAR
+
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'ALCOHOL_STATUS') AS B18
+ON A.[PATIENT_JOIN_KEY] = B18.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B18.FIN_YEAR
+
+    -- Glucose measures
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'HBA1C') AS B19
+ON A.[PATIENT_JOIN_KEY] = B19.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B19.FIN_YEAR
+
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'FPG') AS B20
+ON A.[PATIENT_JOIN_KEY] = B20.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B20.FIN_YEAR
+
+    -- Arthritis
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'R_ARTHRITIS') AS B21
+ON A.[PATIENT_JOIN_KEY] = B21.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B21.FIN_YEAR
+
+    -- CVD FAMILY HISTORY
+LEFT JOIN (SELECT * FROM #EC_TESTS_BEFORE
+		   WHERE [CLUSTER_TYPE] = 'CVD FAMILY HISTORY') AS B22
+ON A.[PATIENT_JOIN_KEY] = B22.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B22.FIN_YEAR
+;
+-- 14,984,656 rows
+
+---------------------------------------------------------------------
+	-- Risk factors on day of NHSHC
+DROP TABLE IF EXISTS #EC_TESTS_ONDAY2;
+
+SELECT A.[PATIENT_JOIN_KEY]
+	,A.FIN_YEAR
+	,A.COHORT
+	,A.INDEX_DATE
+	,C1.VAL1_ONDAY AS 'WEIGHT_ONDAY'
+	,C1.DATE_DIFF_ONDAY AS 'WEIGHT_DIFF_ONDAY'
+	,C2.VAL1_ONDAY AS 'HEIGHT_ONDAY'
+	,C2.DATE_DIFF_ONDAY AS 'HEIGHT_DIFF_ONDAY'
+	,C3.VAL1_ONDAY AS 'BMI_ONDAY'
+	,C3.DATE_DIFF_ONDAY AS 'BMI_DIFF_ONDAY'
+	,C4.VAL1_ONDAY AS 'WAIST_ONDAY'
+	,C4.DATE_DIFF_ONDAY AS 'WAIST_DIFF_ONDAY'
+	,C5.VAL1_ONDAY AS 'SYS_ONDAY'
+	,C5.DATE_DIFF_ONDAY AS 'SYS_DIFF_ONDAY'
+	,C6.VAL1_ONDAY AS 'DIA_ONDAY'
+	,C6.DATE_DIFF_ONDAY AS 'DIA_DIFF_ONDAY'
+	,C7.VAL1_ONDAY AS 'FULL_SYS_ONDAY'
+	,C7.VAL2_ONDAY AS 'FULL_DIA_ONDAY'
+	,C7.DATE_DIFF_ONDAY AS 'FULL_DIFF_ONDAY'
+	,C8.VAL1_ONDAY AS 'TOTAL_ONDAY'
+	,C8.DATE_DIFF_ONDAY AS 'TOTAL_DIFF_ONDAY'
+	,C9.VAL1_ONDAY AS 'HDL_ONDAY'
+	,C9.DATE_DIFF_ONDAY AS 'HDL_DIFF_ONDAY'
+	,C10.VAL1_ONDAY AS 'RATIO_ONDAY'
+	,C10.DATE_DIFF_ONDAY AS 'RATIO_DIFF_ONDAY'
+	,C11.STATUS_ONDAY AS 'SMOKING_ONDAY'
+	,C11.DATE_DIFF_ONDAY AS 'SMOKING_DIFF_ONDAY'
+	,C12.VAL1_ONDAY AS 'QRISK_ONDAY'
+	,C12.DATE_DIFF_ONDAY AS 'QRISK_DIFF_ONDAY'
+	,C23.VAL1_ONDAY AS 'FRAMINGHAM_ONDAY'
+	,C23.DATE_DIFF_ONDAY AS 'FRAMINGHAM_DIFF_ONDAY'
+	,C13.STATUS_ONDAY AS 'PULSE_ONDAY'
+	,C13.DATE_DIFF_ONDAY AS 'PULSE_DIFF_ONDAY'
+	,C14.STATUS_ONDAY AS 'GPPAQ_ONDAY'
+	,C14.DATE_DIFF_ONDAY AS 'GPPAQ_DIFF_ONDAY'
+	,C15.VAL1_ONDAY AS 'FAST_ONDAY'
+	,C15.DATE_DIFF_ONDAY AS 'FAST_DIFF_ONDAY'
+	,C16.VAL1_ONDAY AS 'AUDIT_ONDAY'
+	,C16.DATE_DIFF_ONDAY AS 'AUDIT_DIFF_ONDAY'
+	,C17.VAL1_ONDAY AS 'AUDITC_ONDAY'
+	,C17.DATE_DIFF_ONDAY AS 'AUDITC_DIFF_ONDAY'
+	,C18.STATUS_ONDAY AS 'ALCOHOL_STATUS_ONDAY'
+	,C18.DATE_DIFF_ONDAY AS 'ALCOHOL_DIFF_ONDAY'
+	,C23.VAL1_ONDAY AS 'ALCOHOL_UNITS_ONDAY'
+	,C19.VAL1_ONDAY AS 'HBA1C_ONDAY'
+	,C19.DATE_DIFF_ONDAY AS 'HBA1C_DIFF_ONDAY'
+	,C20.VAL1_ONDAY AS 'FPG_ONDAY'
+	,C20.DATE_DIFF_ONDAY AS 'FPG_DIFF_ONDAY'
+	,C21.STATUS_ONDAY AS 'R_ARTHRITIS_ONDAY'
+	,C21.DATE_DIFF_ONDAY AS 'R_ARTHRITIS_DIFF_ONDAY'
+	,C22.STATUS_ONDAY AS 'CVD_FAMILY_ONDAY'
+	,C22.DATE_DIFF_ONDAY AS 'CVD_FAMILY_DIFF_ONDAY'
+
+	,CASE WHEN (C1.VAL_FLAG_ONDAY = 2 AND C2.VAL_FLAG_ONDAY = 2)  -- Calculate BMI from height and weight where available
+	      AND C1.VAL1_ONDAY/((C2.VAL1_ONDAY/100)*(C2.VAL1_ONDAY/100)) >= 12 
+		  AND C1.VAL1_ONDAY/((C2.VAL1_ONDAY/100)*(C2.VAL1_ONDAY/100)) <= 90
+	      THEN C1.VAL1_ONDAY/((C2.VAL1_ONDAY/100)*(C2.VAL1_ONDAY/100)) END AS BMI_ONDAY_CALC
+	,CASE WHEN (C8.VAL_FLAG_ONDAY = 2 AND C9.VAL_FLAG_ONDAY = 2)  -- Calculate CHOL from total and HDL where available
+	      THEN C8.VAL1_ONDAY/C9.VAL1_ONDAY END AS CHOL_RATIO_ONDAY_CALC
+	,CASE WHEN (C1.VAL_FLAG_ONDAY = 1 OR C2.VAL_FLAG_ONDAY = 1    -- Mark if test unsuitable/declined for
+	           OR C7.VAL_FLAG_ONDAY = 1 OR C10.VAL_FLAG_ONDAY = 1 -- height, weight, cholesterol, BP, CVD RISK SCORE or GPPAQ
+	           OR C12.VAL_FLAG_ONDAY = 1 OR C14.VAL_FLAG_ONDAY = 1)
+		  THEN 1 ELSE 0 END AS UNSUITABLE_DECLINED_ONDAY
+
+INTO #EC_TESTS_ONDAY2
+FROM [NHS_Health_Checks].[dbo].EC_2_COHORT_CHARS AS A
+
+	-- BMI, Height, Weight, Waist measures
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'WEIGHT') AS C1
+ON A.[PATIENT_JOIN_KEY] = C1.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C1.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'HEIGHT') AS C2
+ON A.[PATIENT_JOIN_KEY] = C2.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C2.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'BMI') AS C3
+ON A.[PATIENT_JOIN_KEY] = C3.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C3.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'WAIST') AS C4
+ON A.[PATIENT_JOIN_KEY] = C4.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C4.FIN_YEAR
+
+	-- BP measures
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'SYSTOLIC') AS C5
+ON A.[PATIENT_JOIN_KEY] = C5.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C5.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'DIASTOLIC') AS C6
+ON A.[PATIENT_JOIN_KEY] = C6.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C6.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'FULL BP') AS C7
+ON A.[PATIENT_JOIN_KEY] = C7.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C7.FIN_YEAR
+
+	-- CHOL measures
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'TOTAL CHOL') AS C8
+ON A.[PATIENT_JOIN_KEY] = C8.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C8.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'HDL CHOL') AS C9
+ON A.[PATIENT_JOIN_KEY] = C9.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C9.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'CHOL RATIO') AS C10
+ON A.[PATIENT_JOIN_KEY] = C10.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C10.FIN_YEAR
+
+    -- Smoking status
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'SMOKING') AS C11
+ON A.[PATIENT_JOIN_KEY] = C11.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C11.FIN_YEAR
+
+    -- CVD risk score
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'QRISK') AS C12
+ON A.[PATIENT_JOIN_KEY] = C12.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C12.FIN_YEAR
+
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'FRAMINGHAM') AS C23
+ON A.[PATIENT_JOIN_KEY] = C23.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C23.FIN_YEAR
+
+    -- Pulse status
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'PULSE') AS C13
+ON A.[PATIENT_JOIN_KEY] = C13.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C13.FIN_YEAR
+
+    -- Physical activity status
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'GPPAQ') AS C14
+ON A.[PATIENT_JOIN_KEY] = C14.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C14.FIN_YEAR
+
+    -- Alcohol scores
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'FAST') AS C15
+ON A.[PATIENT_JOIN_KEY] = C15.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C15.FIN_YEAR
+
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'AUDIT') AS C16
+ON A.[PATIENT_JOIN_KEY] = C16.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C16.FIN_YEAR
+
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'AUDITC') AS C17
+ON A.[PATIENT_JOIN_KEY] = C17.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C17.FIN_YEAR
+
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'ALCOHOL_STATUS') AS C18
+ON A.[PATIENT_JOIN_KEY] = C18.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C18.FIN_YEAR
+
+    -- Glucose measures
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'HBA1C') AS C19
+ON A.[PATIENT_JOIN_KEY] = C19.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C19.FIN_YEAR
+
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'FPG') AS C20
+ON A.[PATIENT_JOIN_KEY] = C20.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C20.FIN_YEAR
+
+    -- Arthritis
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'R_ARTHRITIS') AS C21
+ON A.[PATIENT_JOIN_KEY] = C21.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C21.FIN_YEAR
+
+    -- CVD FAMILY HISTORY
+LEFT JOIN (SELECT * FROM #EC_TESTS_ONDAY
+		   WHERE [CLUSTER_TYPE] = 'CVD FAMILY HISTORY') AS C22
+ON A.[PATIENT_JOIN_KEY] = C22.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C22.FIN_YEAR
+;
+-- 14,984,656 row
+
+
+---------------------------------------------------------------------
+	-- Risk factors after NHSHC
+DROP TABLE IF EXISTS #EC_TESTS_AFTER2;
+
+SELECT A.[PATIENT_JOIN_KEY]
+	,A.FIN_YEAR
+	,A.COHORT
+	,A.INDEX_DATE
+	,D1.VAL1_AFTER AS 'WEIGHT_AFTER'
+	,D1.DATE_DIFF_AFTER AS 'WEIGHT_DIFF_AFTER'
+	,D2.VAL1_AFTER AS 'HEIGHT_AFTER'
+	,D2.DATE_DIFF_AFTER AS 'HEIGHT_DIFF_AFTER'
+	,D3.VAL1_AFTER AS 'BMI_AFTER'
+	,D3.DATE_DIFF_AFTER AS 'BMI_DIFF_AFTER'
+	,D4.VAL1_AFTER AS 'WAIST_AFTER'
+	,D4.DATE_DIFF_AFTER AS 'WAIST_DIFF_AFTER'
+	,D5.VAL1_AFTER AS 'SYS_AFTER'
+	,D5.DATE_DIFF_AFTER AS 'SYS_DIFF_AFTER'
+	,D6.VAL1_AFTER AS 'DIA_AFTER'
+	,D6.DATE_DIFF_AFTER AS 'DIA_DIFF_AFTER'
+	,D7.VAL1_AFTER AS 'FULL_SYS_AFTER'
+	,D7.VAL2_AFTER AS 'FULL_DIA_AFTER'
+	,D7.DATE_DIFF_AFTER AS 'FULL_DIFF_AFTER'
+	,D8.VAL1_AFTER AS 'TOTAL_AFTER'
+	,D8.DATE_DIFF_AFTER AS 'TOTAL_DIFF_AFTER'
+	,D9.VAL1_AFTER AS 'HDL_AFTER'
+	,D9.DATE_DIFF_AFTER AS 'HDL_DIFF_AFTER'
+	,D10.VAL1_AFTER AS 'RATIO_AFTER'
+	,D10.DATE_DIFF_AFTER AS 'RATIO_DIFF_AFTER'
+	,D11.STATUS_AFTER AS 'SMOKING_AFTER'
+	,D11.DATE_DIFF_AFTER AS 'SMOKING_DIFF_AFTER'
+	,D12.VAL1_AFTER AS 'QRISK_AFTER'
+	,D12.DATE_DIFF_AFTER AS 'QRISK_DIFF_AFTER'
+	,D23.VAL1_AFTER AS 'FRAMINGHAM_AFTER'
+	,D23.DATE_DIFF_AFTER AS 'FRAMINGHAM_DIFF_AFTER'
+	,D13.STATUS_AFTER AS 'PULSE_AFTER'
+	,D13.DATE_DIFF_AFTER AS 'PULSE_DIFF_AFTER'
+	,D14.STATUS_AFTER AS 'GPPAQ_AFTER'
+	,D14.DATE_DIFF_AFTER AS 'GPPAQ_DIFF_AFTER'
+	,D15.VAL1_AFTER AS 'FAST_AFTER'
+	,D15.DATE_DIFF_AFTER AS 'FAST_DIFF_AFTER'
+	,D16.VAL1_AFTER AS 'AUDIT_AFTER'
+	,D16.DATE_DIFF_AFTER AS 'AUDIT_DIFF_AFTER'
+	,D17.VAL1_AFTER AS 'AUDITC_AFTER'
+	,D17.DATE_DIFF_AFTER AS 'AUDITC_DIFF_AFTER'
+	,D18.STATUS_AFTER AS 'ALCOHOL_STATUS_AFTER'
+	,D18.DATE_DIFF_AFTER AS 'ALCOHOL_DIFF_AFTER'
+	,D23.VAL1_AFTER AS 'ALCOHOL_UNITS_AFTER'
+	,D19.VAL1_AFTER AS 'HBA1C_AFTER'
+	,D19.DATE_DIFF_AFTER AS 'HBA1C_DIFF_AFTER'
+	,D20.VAL1_AFTER AS 'FPG_AFTER'
+	,D20.DATE_DIFF_AFTER AS 'FPG_DIFF_AFTER'
+	,D21.STATUS_AFTER AS 'R_ARTHRITIS_AFTER'
+	,D21.DATE_DIFF_AFTER AS 'R_ARTHRITIS_DIFF_AFTER'
+	,D22.STATUS_AFTER AS 'CVD_FAMILY_AFTER'
+	,D22.DATE_DIFF_AFTER AS 'CVD_FAMILY_DIFF_AFTER'
+
+	,CASE WHEN (D1.VAL_FLAG_AFTER = 2 AND D2.VAL_FLAG_AFTER = 2)  -- Calculate BMI from height and weight where available
+	      AND D1.VAL1_AFTER/((D2.VAL1_AFTER/100)*(D2.VAL1_AFTER/100)) >= 12 
+		  AND D1.VAL1_AFTER/((D2.VAL1_AFTER/100)*(D2.VAL1_AFTER/100)) <= 90
+	      THEN D1.VAL1_AFTER/((D2.VAL1_AFTER/100)*(D2.VAL1_AFTER/100)) END AS BMI_AFTER_CALC
+	,CASE WHEN (D8.VAL_FLAG_AFTER = 2 AND D9.VAL_FLAG_AFTER = 2)  -- Calculate CHOL from total and HDL where available
+	      THEN D8.VAL1_AFTER/D9.VAL1_AFTER END AS CHOL_RATIO_AFTER_CALC
+	,CASE WHEN (D1.VAL_FLAG_AFTER = 1 OR D2.VAL_FLAG_AFTER = 1    -- Mark if test unsuitable/declined for
+	           OR D7.VAL_FLAG_AFTER = 1 OR D10.VAL_FLAG_AFTER = 1 -- height, weight, cholesterol, BP, CVD RISK SCORE or GPPAQ
+	           OR D12.VAL_FLAG_AFTER = 1 OR D14.VAL_FLAG_AFTER = 1)
+		  THEN 1 ELSE 0 END AS UNSUITABLE_DECLINED_AFTER
+
+INTO #EC_TESTS_AFTER2
+FROM [NHS_Health_Checks].[dbo].EC_2_COHORT_CHARS AS A
+
+	-- BMI, Height, Weight, Waist measures
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'WEIGHT') AS D1
+ON A.[PATIENT_JOIN_KEY] = D1.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D1.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'HEIGHT') AS D2
+ON A.[PATIENT_JOIN_KEY] = D2.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D2.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'BMI') AS D3
+ON A.[PATIENT_JOIN_KEY] = D3.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D3.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'WAIST') AS D4
+ON A.[PATIENT_JOIN_KEY] = D4.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D4.FIN_YEAR
+
+	-- BP measures
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'SYSTOLIC') AS D5
+ON A.[PATIENT_JOIN_KEY] = D5.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D5.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'DIASTOLIC') AS D6
+ON A.[PATIENT_JOIN_KEY] = D6.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D6.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'FULL BP') AS D7
+ON A.[PATIENT_JOIN_KEY] = D7.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D7.FIN_YEAR
+
+	-- CHOL measures
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'TOTAL CHOL') AS D8
+ON A.[PATIENT_JOIN_KEY] = D8.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D8.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'HDL CHOL') AS D9
+ON A.[PATIENT_JOIN_KEY] = D9.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D9.FIN_YEAR
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'CHOL RATIO') AS D10
+ON A.[PATIENT_JOIN_KEY] = D10.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D10.FIN_YEAR
+
+    -- Smoking status
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'SMOKING') AS D11
+ON A.[PATIENT_JOIN_KEY] = D11.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D11.FIN_YEAR
+
+    -- CVD risk score
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'QRISK') AS D12
+ON A.[PATIENT_JOIN_KEY] = D12.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D12.FIN_YEAR
+
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'FRAMINGHAM') AS D23
+ON A.[PATIENT_JOIN_KEY] = D23.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D23.FIN_YEAR
+
+    -- Pulse status
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'PULSE') AS D13
+ON A.[PATIENT_JOIN_KEY] = D13.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D13.FIN_YEAR
+
+    -- Physical activity status
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'GPPAQ') AS D14
+ON A.[PATIENT_JOIN_KEY] = D14.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D14.FIN_YEAR
+
+    -- Alcohol scores
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'FAST') AS D15
+ON A.[PATIENT_JOIN_KEY] = D15.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D15.FIN_YEAR
+
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'AUDIT') AS D16
+ON A.[PATIENT_JOIN_KEY] = D16.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D16.FIN_YEAR
+
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'AUDITC') AS D17
+ON A.[PATIENT_JOIN_KEY] = D17.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D17.FIN_YEAR
+
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'ALCOHOL_STATUS') AS D18
+ON A.[PATIENT_JOIN_KEY] = D18.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D18.FIN_YEAR
+
+    -- Glucose measures
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'HBA1C') AS D19
+ON A.[PATIENT_JOIN_KEY] = D19.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D19.FIN_YEAR
+
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'FPG') AS D20
+ON A.[PATIENT_JOIN_KEY] = D20.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D20.FIN_YEAR
+
+    -- Arthritis
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'R_ARTHRITIS') AS D21
+ON A.[PATIENT_JOIN_KEY] = D21.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D21.FIN_YEAR
+
+    -- CVD FAMILY HISTORY
+LEFT JOIN (SELECT * FROM #EC_TESTS_AFTER
+		   WHERE [CLUSTER_TYPE] = 'CVD FAMILY HISTORY') AS D22
+ON A.[PATIENT_JOIN_KEY] = D22.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D22.FIN_YEAR
+;
+-- 14,984,656 rows
+
+-- Drop intermediary tables
+DROP TABLE IF EXISTS #EC_TESTS_BEFORE
+DROP TABLE IF EXISTS #EC_TESTS_ONDAY
+DROP TABLE IF EXISTS #EC_TESTS_AFTER
+
+    --------------------------------------------------------------
+	-- STEP 4 - Assign final risk factor metrics to patients
+    --------------------------------------------------------------
+
+DROP TABLE IF EXISTS #PATIENT_METRICS;
+
+SELECT * INTO #PATIENT_METRICS 
+FROM (
+
+SELECT 
+A.*
+	,COALESCE(HEIGHT_ONDAY, HEIGHT_BEFORE, HEIGHT_AFTER) AS HEIGHT
+	,COALESCE(WEIGHT_ONDAY, WEIGHT_BEFORE, WEIGHT_AFTER) AS [WEIGHT]
+	,COALESCE(BMI_ONDAY, BMI_ONDAY_CALC, BMI_BEFORE, BMI_BEFORE_CALC, BMI_AFTER, BMI_AFTER_CALC) AS BMI
+	,COALESCE(WAIST_ONDAY, WAIST_BEFORE, WAIST_AFTER) AS WAIST
+	,COALESCE(FULL_SYS_ONDAY, SYS_ONDAY, FULL_SYS_BEFORE, SYS_BEFORE, FULL_SYS_AFTER, SYS_AFTER) AS SYS_BP
+	,COALESCE(FULL_DIA_ONDAY, DIA_ONDAY, FULL_DIA_BEFORE, DIA_BEFORE, FULL_DIA_AFTER, DIA_AFTER) AS DIA_BP
+	,COALESCE(TOTAL_ONDAY, TOTAL_BEFORE, TOTAL_AFTER) AS CHOL_TOTAL
+	,COALESCE(HDL_ONDAY, HDL_BEFORE, HDL_AFTER) AS CHOL_HDL
+	,COALESCE(RATIO_ONDAY, CHOL_RATIO_ONDAY_CALC, RATIO_BEFORE, CHOL_RATIO_BEFORE_CALC, RATIO_AFTER, CHOL_RATIO_AFTER_CALC) AS CHOL_RATIO
+	,COALESCE(SMOKING_ONDAY, SMOKING_BEFORE, SMOKING_AFTER) AS SMOKING
+	--,COALESCE(CVD_RISK_ONDAY, CVD_RISK_BEFORE, CVD_RISK_AFTER) AS CVD_RISK_SCORE
+	,COALESCE(QRISK_ONDAY, QRISK_BEFORE, QRISK_AFTER) AS QRISK
+	,COALESCE(FRAMINGHAM_ONDAY, FRAMINGHAM_BEFORE, FRAMINGHAM_AFTER) AS FRAMINGHAM
+	,COALESCE(PULSE_ONDAY, PULSE_BEFORE, PULSE_AFTER) AS PULSE
+	,COALESCE(GPPAQ_ONDAY, GPPAQ_BEFORE, GPPAQ_AFTER) AS GPPAQ
+	,COALESCE(FAST_ONDAY, FAST_BEFORE, FAST_AFTER) AS 'FAST'
+	,COALESCE(AUDIT_ONDAY, AUDIT_BEFORE, AUDIT_AFTER) AS 'AUDIT'
+	,COALESCE(AUDITC_ONDAY, AUDITC_BEFORE, AUDITC_AFTER) AS AUDITC
+	,COALESCE(ALCOHOL_STATUS_ONDAY, ALCOHOL_STATUS_BEFORE, ALCOHOL_STATUS_AFTER) AS ALCOHOL_STATUS
+	,COALESCE(ALCOHOL_UNITS_ONDAY, ALCOHOL_UNITS_BEFORE, ALCOHOL_UNITS_AFTER) AS ALCOHOL_UNITS
+	,COALESCE(HBA1C_ONDAY, HBA1C_BEFORE, HBA1C_AFTER) AS HBA1C
+	,COALESCE(FPG_ONDAY, FPG_BEFORE, FPG_AFTER) AS FPG
+	,COALESCE(R_ARTHRITIS_ONDAY, R_ARTHRITIS_BEFORE, R_ARTHRITIS_AFTER) AS R_ARTHRITIS
+	,COALESCE(CVD_FAMILY_ONDAY, CVD_FAMILY_BEFORE, CVD_FAMILY_AFTER) AS CVD_FAMILY
+
+FROM [NHS_Health_Checks].[dbo].[EC_2_COHORT_CHARS] AS A
+
+LEFT JOIN #EC_TESTS_ONDAY2 AS B 
+ON A.[PATIENT_JOIN_KEY] = B.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = B.FIN_YEAR
+
+LEFT JOIN #EC_TESTS_BEFORE2 AS C
+ON A.[PATIENT_JOIN_KEY] = C.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = C.FIN_YEAR
+
+LEFT JOIN #EC_TESTS_AFTER2 AS D
+ON A.[PATIENT_JOIN_KEY] = D.[PATIENT_JOIN_KEY]
+AND A.FIN_YEAR = D.FIN_YEAR 
+) AS X;
+-- 14,984,656 rows
+
+
+    --------------------------------------------------------------
+	-- STEP 5 - Save to permanent table
+    --------------------------------------------------------------
+
+/* Add in label for a full NHSHC (valid BMI, BP and CHOL reading) */
+DROP TABLE IF EXISTS [NHS_Health_Checks].[dbo].[EC_3_COHORT_RISK_FACTORS];
+
+SELECT * INTO [NHS_Health_Checks].[dbo].[EC_3_COHORT_RISK_FACTORS]
+FROM #PATIENT_METRICS AS X;
+-- 14,984,656 rows
+
+SELECT TOP 10 * FROM [NHS_Health_Checks].[dbo].[EC_3_COHORT_RISK_FACTORS];
+
+
+-- Drop intermediary tables
+DROP TABLE IF EXISTS #EC_TESTS_EXTRACT;
+DROP TABLE IF EXISTS #EC_TESTS_EXTRACT2;
+DROP TABLE IF EXISTS #EC_TESTS_BEFORE
+DROP TABLE IF EXISTS #EC_TESTS_BEFORE2
+DROP TABLE IF EXISTS #EC_TESTS_ONDAY
+DROP TABLE IF EXISTS #EC_TESTS_ONDAY2
+DROP TABLE IF EXISTS #EC_TESTS_AFTER
+DROP TABLE IF EXISTS #EC_TESTS_AFTER2
+
+
+ 
